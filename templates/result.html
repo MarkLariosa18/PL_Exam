@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Visualization Result</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .container { max-width: 800px; margin: auto; }
+        img { max-width: 100%; height: auto; }
+        .context { margin-top: 20px; padding: 10px; border: 1px solid #ccc; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Visualization Result</h1>
+        <img src="{{ plot_url }}" alt="Data Visualization">
+        <div class="context">
+            <h2>Context from DOCX</h2>
+            <p>{{ context }}</p>
+        </div>
+        <a href="/">Back to Upload</a>
+    </div>
+</body>
+</html>
