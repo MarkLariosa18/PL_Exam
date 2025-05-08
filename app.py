@@ -138,7 +138,7 @@ def select_categorical_pair(df, cat_cols):
     min_p = 1
     for i, col1 in enumerate(cat_cols):
         for col2 in cat_cols[i+1:]:
-            цtab = pd.crosstab(df[col1], df[col2])
+            ctab = pd.crosstab(df[col1], df[col2])
             if ctab.size > 0 and ctab.shape[0] > 1 and ctab.shape[1] > 1:
                 try:
                     _, p, _, _ = chi2_contingency(ctab)
