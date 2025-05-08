@@ -1,4 +1,6 @@
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import seaborn as sns
 from flask import Flask, render_template
@@ -11,6 +13,11 @@ import threading
 import time
 import requests
 from urllib.parse import urljoin
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -68,7 +75,7 @@ def load_data(dataset_num):
             files_read = 0
             for file in csv_files:
                 if not os.path.exists(file):
-                    print(f"Warning: File not found: {file}")
+                    logger.warning(f"File not found: {file}")
                     continue
                 try:
                     df = pd.read_csv(file)
@@ -83,7 +90,7 @@ def load_data(dataset_num):
                     combined_df = pd.concat([combined_df, df], ignore_index=True, sort=False)
                     files_read += 1
                 except Exception as e:
-                    print(f"Error reading {file}: {str(e)}")
+                    logger.error(f"Error reading {file}: {str(e)}")
             if files_read == 0:
                 raise ValueError("No valid CSV files found for Dataset 5")
             if combined_df.empty:
@@ -92,7 +99,7 @@ def load_data(dataset_num):
         df.columns = df.columns.str.lower().str.replace(' ', '_')
         return clean_data(df)
     except Exception as e:
-        print(f"Error loading dataset {dataset_num}: {str(e)}")
+        logger.error(f"Error loading dataset {dataset_num}: {str(e)}")
         return None
 
 # Select top numeric columns based on variance
@@ -131,7 +138,7 @@ def select_categorical_pair(df, cat_cols):
     min_p = 1
     for i, col1 in enumerate(cat_cols):
         for col2 in cat_cols[i+1:]:
-            ctab = pd.crosstab(df[col1], df[col2])
+            цtab = pd.crosstab(df[col1], df[col2])
             if ctab.size > 0 and ctab.shape[0] > 1 and ctab.shape[1] > 1:
                 try:
                     _, p, _, _ = chi2_contingency(ctab)
@@ -148,26 +155,22 @@ def select_dataset_columns(df, dataset_num):
     cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
     
     if dataset_num == 1:
-        # Football statistics: prioritize goals, assists, shots, passes, etc.
         football_num = ['goals', 'assists', 'shots', 'passes', 'tackles', 'saves', 'minutes_played']
         selected_num = [col for col in football_num if col in num_cols][:3]
         if len(selected_num) < 3:
             selected_num.extend(select_numeric_columns(df, [col for col in num_cols if col not in selected_num], max_cols=3-len(selected_num)))
         selected_cat = select_categorical_columns(df, cat_cols, max_cols=2)
     elif dataset_num == 3:
-        # Diamond: use carat (numeric), cut (categorical), color (categorical)
         selected_num = ['carat'] if 'carat' in num_cols else select_numeric_columns(df, num_cols, max_cols=1)
         selected_cat = [col for col in ['cut', 'color'] if col in cat_cols]
         if len(selected_cat) < 2:
             selected_cat.extend(select_categorical_columns(df, [col for col in cat_cols if col not in selected_cat], max_cols=2-len(selected_cat)))
     elif dataset_num == 4:
-        # TELECOM: use age_group (categorical), distinct_called_numbers (numeric), frequency_of_use (numeric)
         selected_num = [col for col in ['distinct_called_numbers', 'frequency_of_use'] if col in num_cols]
         if len(selected_num) < 2:
             selected_num.extend(select_numeric_columns(df, [col for col in num_cols if col not in selected_num], max_cols=2-len(selected_num)))
         selected_cat = ['age_group'] if 'age_group' in cat_cols else select_categorical_columns(df, cat_cols, max_cols=1)
     else:
-        # Default for Datasets 2 and 5
         selected_num = select_numeric_columns(df, num_cols, max_cols=3)
         selected_cat = select_categorical_columns(df, cat_cols, max_cols=3)
     
@@ -257,8 +260,8 @@ def create_visualization(df, title, viz_type, dataset_num):
         os.makedirs('static')
 
     img = BytesIO()
+    fig = plt.figure(figsize=(12, 8))  # Explicit figure creation
     try:
-        plt.figure(figsize=(12, 8))
         num_cols = df.select_dtypes(include=['number']).columns.tolist()
         cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
         selected_num, selected_cat = select_dataset_columns(df, dataset_num)
@@ -407,16 +410,15 @@ def create_visualization(df, title, viz_type, dataset_num):
         plt.savefig(img, format='png', bbox_inches='tight', dpi=100)
         img.seek(0)
         plot = f'data:image/png;base64,{base64.b64encode(img.getvalue()).decode()}'
-        plt.close()
-
     except Exception as e:
-        print(f"Error plotting {title}: {e}")
+        logger.error(f"Error plotting {title}: {e}")
         plt.figure(figsize=(12, 8))
         plt.text(0.5, 0.5, f"Error generating plot: {str(e)}", ha='center', va='center', fontsize=12)
         plt.savefig(img, format='png', bbox_inches='tight')
         img.seek(0)
         plot = f'data:image/png;base64,{base64.b64encode(img.getvalue()).decode()}'
-        plt.close()
+    finally:
+        plt.close(fig)  # Ensure figure is closed
 
     return plot
 
@@ -488,22 +490,27 @@ def index():
         return render_template('index.html', info=dataset_info, plots=all_plots, error=error)
 
     except Exception as e:
+        logger.error(f"Error processing datasets: {str(e)}")
         error = f"Error processing datasets: {str(e)}"
         return render_template('index.html', info={}, plots={}, error=error)
+
+@app.route('/health')
+def health():
+    return 'OK', 200
 
 # Ping function to keep the app alive
 def keep_alive():
     url = os.getenv('RENDER_EXTERNAL_URL')
     if not url:
-        print("No RENDER_EXTERNAL_URL set, skipping ping")
+        logger.warning("No RENDER_EXTERNAL_URL set, skipping ping")
         return
     ping_url = urljoin(url, '/')
     while True:
         try:
             response = requests.get(ping_url, timeout=10)
-            print(f"Pinged {ping_url} - Status: {response.status_code}")
+            logger.info(f"Pinged {ping_url} - Status: {response.status_code}")
         except Exception as e:
-            print(f"Error pinging {ping_url}: {str(e)}")
+            logger.error(f"Error pinging {ping_url}: {str(e)}")
         time.sleep(14 * 60)  # Sleep for 14 minutes
 
 # Start the keep-alive thread
@@ -512,4 +519,5 @@ if os.getenv('RENDER'):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    logger.info(f"Starting Gunicorn on 0.0.0.0:{port}")
+    os.system(f"gunicorn -w 2 --threads 2 --preload -b 0.0.0.0:{port} app:app")
