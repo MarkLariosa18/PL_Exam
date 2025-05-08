@@ -9,17 +9,19 @@ from io import BytesIO
 import base64
 import numpy as np
 from scipy.stats import chi2_contingency
-import threading
-import time
-import requests
-from urllib.parse import urljoin
 import logging
+from werkzeug.middleware.proxy_fix import ProxyFix
+from functools import lru_cache
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+# Ensure static directory exists
+os.makedirs('static', exist_ok=True)
 
 # Dataset titles
 dataset_titles = {
@@ -32,14 +34,18 @@ dataset_titles = {
 
 # Clean data
 def clean_data(df):
-    df = df.drop_duplicates()
-    df = df.dropna(how='all')
-    for col in df.columns:
-        if df[col].dtype == 'object':
-            df[col] = df[col].fillna('Unknown')
-        elif df[col].dtype in ['int64', 'float64']:
-            df[col] = df[col].fillna(df[col].median())
-    return df
+    try:
+        df = df.drop_duplicates()
+        df = df.dropna(how='all')
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                df[col] = df[col].fillna('Unknown')
+            elif df[col].dtype in ['int64', 'float64']:
+                df[col] = df[col].fillna(df[col].median())
+        return df
+    except Exception as e:
+        logger.error(f"Error cleaning data: {str(e)}")
+        return None
 
 # Generate context from CSV data
 def generate_context(df):
@@ -61,9 +67,11 @@ def generate_context(df):
     except Exception as e:
         return f"Error generating context: {str(e)}"
 
-# Load data for a dataset
+# Load data for a dataset with caching
+@lru_cache(maxsize=5)
 def load_data(dataset_num):
     try:
+        logger.info(f"Loading dataset {dataset_num}")
         if dataset_num < 5:
             csv_path = f'dataset_{dataset_num}/matches_{dataset_num}.csv'
             if not os.path.exists(csv_path):
@@ -97,7 +105,10 @@ def load_data(dataset_num):
                 raise ValueError("Combined Dataset 5 is empty after processing")
             df = combined_df
         df.columns = df.columns.str.lower().str.replace(' ', '_')
-        return clean_data(df)
+        df = clean_data(df)
+        if df is not None and len(df) > 1000:  # Limit to 1000 rows
+            df = df.sample(n=1000, random_state=1)
+        return df
     except Exception as e:
         logger.error(f"Error loading dataset {dataset_num}: {str(e)}")
         return None
@@ -153,7 +164,7 @@ def select_categorical_pair(df, cat_cols):
 def select_dataset_columns(df, dataset_num):
     num_cols = df.select_dtypes(include=['number']).columns.tolist()
     cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
-    
+
     if dataset_num == 1:
         football_num = ['goals', 'assists', 'shots', 'passes', 'tackles', 'saves', 'minutes_played']
         selected_num = [col for col in football_num if col in num_cols][:3]
@@ -173,7 +184,7 @@ def select_dataset_columns(df, dataset_num):
     else:
         selected_num = select_numeric_columns(df, num_cols, max_cols=3)
         selected_cat = select_categorical_columns(df, cat_cols, max_cols=3)
-    
+
     return selected_num, selected_cat
 
 # Evaluate visualization options and score them
@@ -256,12 +267,9 @@ def evaluate_visualizations(df, dataset_num):
 
 # Create visualization based on selected type
 def create_visualization(df, title, viz_type, dataset_num):
-    if not os.path.exists('static'):
-        os.makedirs('static')
-
     img = BytesIO()
-    fig = plt.figure(figsize=(12, 8))  # Explicit figure creation
     try:
+        plt.figure(figsize=(12, 8))  # Original figure size
         num_cols = df.select_dtypes(include=['number']).columns.tolist()
         cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
         selected_num, selected_cat = select_dataset_columns(df, dataset_num)
@@ -298,7 +306,8 @@ def create_visualization(df, title, viz_type, dataset_num):
                 x_col, y_col, _ = select_numeric_pair(df, num_cols)
                 hue_col = selected_cat[0] if selected_cat else None
                 if x_col and y_col:
-                    sns.scatterplot(x=x_col, y=y_col, hue=hue_col, data=df.sample(n=min(1000, len(df)), random_state=1), alpha=0.6)
+                    sample_df = df.sample(n=min(300, len(df)), random_state=1)
+                    sns.scatterplot(x=x_col, y=y_col, hue=hue_col, data=sample_df, alpha=0.6)
                     plt.title(f'{title} - Relationship between {x_col} and {y_col}', fontsize=14, pad=15)
                     plt.xlabel(x_col, fontsize=12)
                     plt.ylabel(y_col, fontsize=12)
@@ -332,10 +341,7 @@ def create_visualization(df, title, viz_type, dataset_num):
                     else:
                         plt.text(0.5, 0.5, "No data available after filtering categories", ha='center', va='center', fontsize=12)
                 else:
-                    plt.text(0.5, 0.5, f"Need two categorical columns with ≤10 unique values\nFound: {len(cat_cols)} columns, "
-                                       f"{df[cat_col1].nunique() if cat_col1 else 0} and "
-                                       f"{df[cat_col2].nunique() if cat_col2 else 0} unique values",
-                             ha='center', va='center', fontsize=12)
+                    plt.text(0.5, 0.5, f"Need two categorical columns with ≤10 unique values", ha='center', va='center', fontsize=12)
         else:
             if viz_type == 'box_plot':
                 if selected_num:
@@ -366,7 +372,7 @@ def create_visualization(df, title, viz_type, dataset_num):
                 x_col, y_col, _ = select_numeric_pair(df, num_cols)
                 hue_col = selected_cat[0] if selected_cat else None
                 if x_col and y_col:
-                    sample_df = df.sample(n=min(1000, len(df)), random_state=1).sort_values(x_col)
+                    sample_df = df.sample(n=min(300, len(df)), random_state=1).sort_values(x_col)
                     sns.lineplot(x=sample_df[x_col], y=sample_df[y_col], hue=hue_col)
                     plt.title(f'{title} - Line Plot of {x_col} vs {y_col}', fontsize=14, pad=15)
                     plt.xlabel(x_col, fontsize=12)
@@ -392,7 +398,7 @@ def create_visualization(df, title, viz_type, dataset_num):
                     top_cat2 = df[cat_col2].value_counts().index[:10]
                     filtered_df = df[df[cat_col1].isin(top_cat1) & df[cat_col2].isin(top_cat2)]
                     if not filtered_df.empty:
-                        sns.catplot(data=filtered_df, x=cat_col1, hue=cat_col2, kind='count', height=8, aspect=1.5)
+                        sns.countplot(data=filtered_df, x=cat_col1, hue=cat_col2)
                         plt.title(f'{title} - Clustered Bar Plot of {cat_col1} and {cat_col2}', fontsize=14, pad=15)
                         plt.xlabel(cat_col1, fontsize=12)
                         plt.ylabel('Count', fontsize=12)
@@ -401,26 +407,23 @@ def create_visualization(df, title, viz_type, dataset_num):
                     else:
                         plt.text(0.5, 0.5, "No data available after filtering categories", ha='center', va='center', fontsize=12)
                 else:
-                    plt.text(0.5, 0.5, f"Need two categorical columns with ≤10 unique values\nFound: {len(cat_cols)} columns, "
-                                       f"{df[cat_col1].nunique() if cat_col1 else 0} and "
-                                       f"{df[cat_col2].nunique() if cat_col2 else 0} unique values",
-                             ha='center', va='center', fontsize=12)
+                    plt.text(0.5, 0.5, f"Need two categorical columns with ≤10 unique values", ha='center', va='center', fontsize=12)
 
         plt.tight_layout(pad=2.0)
-        plt.savefig(img, format='png', bbox_inches='tight', dpi=100)
+        plt.savefig(img, format='png', bbox_inches='tight', dpi=100)  # Original DPI
         img.seek(0)
         plot = f'data:image/png;base64,{base64.b64encode(img.getvalue()).decode()}'
+        plt.close()
+        return plot
     except Exception as e:
         logger.error(f"Error plotting {title}: {e}")
         plt.figure(figsize=(12, 8))
         plt.text(0.5, 0.5, f"Error generating plot: {str(e)}", ha='center', va='center', fontsize=12)
-        plt.savefig(img, format='png', bbox_inches='tight')
+        plt.savefig(img, format='png', bbox_inches='tight', dpi=100)
         img.seek(0)
         plot = f'data:image/png;base64,{base64.b64encode(img.getvalue()).decode()}'
-    finally:
-        plt.close(fig)  # Ensure figure is closed
-
-    return plot
+        plt.close()
+        return plot
 
 # Assign unique visualizations to each dataset
 def assign_visualizations(datasets_scores):
@@ -447,44 +450,54 @@ def assign_visualizations(datasets_scores):
             assignments[label] = None
     return assignments
 
+# Precompute visualizations
+PRECOMPUTED_PLOTS = {}
+
+def precompute_visualizations():
+    global PRECOMPUTED_PLOTS
+    datasets_scores = {}
+    for i in range(1, 6):
+        label = f'Dataset {i}'
+        title = dataset_titles[i]
+        df = load_data(i)
+        if df is None or df.empty:
+            continue
+        datasets_scores[label] = evaluate_visualizations(df, i)
+    viz_assignments = assign_visualizations(datasets_scores)
+    for i in range(1, 6):
+        label = f'Dataset {i}'
+        title = dataset_titles[i]
+        df = load_data(i)
+        if df is None or df.empty:
+            continue
+        viz_type = viz_assignments.get(label)
+        if viz_type:
+            PRECOMPUTED_PLOTS[label] = create_visualization(df, title, viz_type, i)
+
+# Run during app startup
+with app.app_context():
+    logger.info("Precomputing visualizations")
+    precompute_visualizations()
+
 @app.route('/')
 def index():
     dataset_info = {}
     all_plots = {}
     error = None
-    datasets_scores = {}
 
     try:
         for i in range(1, 6):
             label = f'Dataset {i}'
             title = dataset_titles[i]
-
             df = load_data(i)
             if df is None or df.empty:
                 dataset_info[label] = {'context': f"No data available for {title}", 'title': title}
                 all_plots[label] = None
                 continue
-
             context = generate_context(df)
             dataset_info[label] = {'context': context, 'title': title}
-
-            datasets_scores[label] = evaluate_visualizations(df, i)
-
-        viz_assignments = assign_visualizations(datasets_scores)
-
-        for i in range(1, 6):
-            label = f'Dataset {i}'
-            title = dataset_titles[i]
-            if label not in dataset_info:
-                continue
-            df = load_data(i)
-            if df is None or df.empty:
-                continue
-            viz_type = viz_assignments.get(label)
-            if viz_type:
-                all_plots[label] = create_visualization(df, title, viz_type, i)
-            else:
-                all_plots[label] = None
+            all_plots[label] = PRECOMPUTED_PLOTS.get(label)
+            if not all_plots[label]:
                 dataset_info[label]['context'] += "\nNo suitable visualization available."
 
         return render_template('index.html', info=dataset_info, plots=all_plots, error=error)
@@ -498,26 +511,7 @@ def index():
 def health():
     return 'OK', 200
 
-# Ping function to keep the app alive
-def keep_alive():
-    url = os.getenv('RENDER_EXTERNAL_URL')
-    if not url:
-        logger.warning("No RENDER_EXTERNAL_URL set, skipping ping")
-        return
-    ping_url = urljoin(url, '/')
-    while True:
-        try:
-            response = requests.get(ping_url, timeout=10)
-            logger.info(f"Pinged {ping_url} - Status: {response.status_code}")
-        except Exception as e:
-            logger.error(f"Error pinging {ping_url}: {str(e)}")
-        time.sleep(14 * 60)  # Sleep for 14 minutes
-
-# Start the keep-alive thread
-if os.getenv('RENDER'):
-    threading.Thread(target=keep_alive, daemon=True).start()
-
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    logger.info(f"Starting Gunicorn on 0.0.0.0:{port}")
-    os.system(f"gunicorn -w 2 --threads 2 --preload -b 0.0.0.0:{port} app:app")
+    # For local development only
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
