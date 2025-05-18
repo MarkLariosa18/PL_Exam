@@ -4,7 +4,7 @@ import os
 bind = f"0.0.0.0:{os.getenv('PORT', '10000')}"
 workers = 1  # Reduced from 4 to minimize memory usage
 threads = 2  # Reduced from 4 to lower overhead
-worker_class = "gevent"  # Keep async worker for concurrency
+worker_class = "sync"  # Keep async worker for concurrency
 preload_app = True  # Load app once to save memory
 timeout = 30  # Keep default timeout
 keepalive = 2  # Keep default keep-alive
