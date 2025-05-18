@@ -1,6 +1,4 @@
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import seaborn as sns
 from flask import Flask, render_template
@@ -9,21 +7,23 @@ from io import BytesIO
 import base64
 import numpy as np
 from scipy.stats import chi2_contingency
+import gunicorn
 import logging
-from werkzeug.middleware.proxy_fix import ProxyFix
-from functools import lru_cache
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import matplotlib.gridspec as gridspec
+import requests
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-# Ensure static directory exists
-os.makedirs('static', exist_ok=True)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Dataset titles
+# Set pandas display options to show all rows and columns
+pd.set_option('display.max_rows', None)
+pd.set_option('display.max_columns', None)
+pd.set_option('display.max_colwidth', None)
+
 dataset_titles = {
     1: "League",
     2: "Abalone",
@@ -34,51 +34,49 @@ dataset_titles = {
 
 # Clean data
 def clean_data(df):
-    try:
-        df = df.drop_duplicates()
-        df = df.dropna(how='all')
-        for col in df.columns:
-            if df[col].dtype == 'object':
-                df[col] = df[col].fillna('Unknown')
-            elif df[col].dtype in ['int64', 'float64']:
-                df[col] = df[col].fillna(df[col].median())
-        return df
-    except Exception as e:
-        logger.error(f"Error cleaning data: {str(e)}")
-        return None
+    df = df.drop_duplicates()
+    df = df.dropna(how='all')
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = df[col].fillna('Unknown')
+        elif df[col].dtype in ['int64', 'float64']:
+            df[col] = df[col].fillna(df[col].median())
+    return df
 
 # Generate context from CSV data
-def generate_context(df):
+def generate_csv_context(df):
     try:
         num_cols = df.select_dtypes(include=['number']).columns.tolist()
         cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
-        context = []
-        context.append(f"Dataset contains {len(df)} rows and {len(df.columns)} columns.")
+        context = [f"Dataset contains {len(df)} rows and {len(df.columns)} columns."]
         if num_cols:
             context.append(f"Numeric columns: {', '.join(num_cols)}")
-            for col in num_cols[:3]:
-                context.append(f"- {col}: Mean={df[col].mean():.2f}, Std={df[col].std():.2f}, Min={df[col].min():.2f}, Max={df[col].max():.2f}")
+            for col in num_cols:
+                context.append(f"- {col}: Mean={df[col].mean():.2f}, Std={df[col].std():.2f}, "
+                              f"Min={df[col].min():.2f}, Max={df[col].max():.2f}")
         if cat_cols:
             context.append(f"Categorical columns: {', '.join(cat_cols)}")
-            for col in cat_cols[:3]:
-                top_cats = df[col].value_counts().index[:3]
-                context.append(f"- {col}: Top categories: {', '.join(map(str, top_cats))}")
+            for col in cat_cols:
+                top_cat = df[col].value_counts().idxmax()
+                top_count = df[col].value_counts().max()
+                context.append(f"- {col}: Most frequent value='{top_cat}' ({top_count} occurrences)")
         return '\n'.join(context)
     except Exception as e:
+        logger.error(f"Error generating CSV context: {str(e)}")
         return f"Error generating context: {str(e)}"
 
-# Load data for a dataset with caching
-@lru_cache(maxsize=5)
+# Load data for a dataset
 def load_data(dataset_num):
     try:
-        logger.info(f"Loading dataset {dataset_num}")
+        base_path = os.getenv('DATASET_PATH', '')
         if dataset_num < 5:
-            csv_path = f'dataset_{dataset_num}/matches_{dataset_num}.csv'
+            csv_path = os.path.join(base_path, f'dataset_{dataset_num}/matches_{dataset_num}.csv')
             if not os.path.exists(csv_path):
                 raise FileNotFoundError(f"CSV file not found: {csv_path}")
             df = pd.read_csv(csv_path)
+            logger.info(f"Loaded {dataset_titles[dataset_num]} with shape {df.shape}")
         else:
-            csv_files = [f'dataset_5/matches_5_{j}.csv' for j in range(1, 11)]
+            csv_files = [os.path.join(base_path, f'dataset_5/matches_5_{j}.csv') for j in range(1, 11)]
             combined_df = pd.DataFrame()
             files_read = 0
             for file in csv_files:
@@ -100,418 +98,363 @@ def load_data(dataset_num):
                 except Exception as e:
                     logger.error(f"Error reading {file}: {str(e)}")
             if files_read == 0:
-                raise ValueError("No valid CSV files found for Dataset 5")
+                raise ValueError("No valid CSV files found for STOCKS")
             if combined_df.empty:
-                raise ValueError("Combined Dataset 5 is empty after processing")
+                raise ValueError("Combined STOCKS is empty after processing")
             df = combined_df
+            logger.info(f"Loaded {dataset_titles[dataset_num]} with shape {df.shape}, {files_read} files combined")
         df.columns = df.columns.str.lower().str.replace(' ', '_')
-        df = clean_data(df)
-        if df is not None and len(df) > 1000:  # Limit to 1000 rows
-            df = df.sample(n=1000, random_state=1)
-        return df
+        cleaned_df = clean_data(df)
+        logger.info(f"Cleaned {dataset_titles[dataset_num]} with shape {cleaned_df.shape}, columns: {cleaned_df.columns.tolist()}")
+        return cleaned_df
     except Exception as e:
-        logger.error(f"Error loading dataset {dataset_num}: {str(e)}")
+        logger.error(f"Error loading {dataset_titles[dataset_num]}: {str(e)}")
         return None
 
-# Select top numeric columns based on variance
-def select_numeric_columns(df, num_cols, max_cols=3):
+# Select numeric columns with sufficient unique values
+def select_numeric_columns(df, num_cols):
     if not num_cols:
+        logger.warning("No numeric columns available")
         return []
-    variances = df[num_cols].var()
-    sorted_cols = variances.sort_values(ascending=False).index.tolist()
-    return sorted_cols[:min(max_cols, len(sorted_cols))]
+    valid_cols = [col for col in num_cols if df[col].nunique() > 1]
+    logger.info(f"Numeric columns with >1 unique value: {valid_cols}")
+    return valid_cols if valid_cols else num_cols[:1] if num_cols else []
 
-# Select top categorical columns based on value counts
-def select_categorical_columns(df, cat_cols, max_cols=3):
+# Select categorical columns
+def select_categorical_columns(df, cat_cols):
     if not cat_cols:
+        logger.warning("No categorical columns available")
         return []
-    value_counts = [df[col].value_counts().iloc[:10].sum() for col in cat_cols]
-    sorted_cols = [cat_cols[i] for i in np.argsort(value_counts)[::-1]]
-    return sorted_cols[:min(max_cols, len(sorted_cols))]
+    valid_cols = [col for col in cat_cols if df[col].nunique() > 0]
+    logger.info(f"Categorical columns: {valid_cols}")
+    return valid_cols
 
-# Select the most correlated numeric pair
-def select_numeric_pair(df, num_cols):
-    if len(num_cols) < 2:
-        return None, None, 0
-    corr = df[num_cols].corr().abs()
-    np.fill_diagonal(corr.values, 0)
-    max_corr = corr.max().max()
-    if max_corr > 0:
-        pair = corr.stack().idxmax()
-        return pair[0], pair[1], max_corr
-    return num_cols[0], num_cols[1], 0
-
-# Select the most associated categorical pair (chi-squared test)
+# Select a categorical pair for stacked bar
 def select_categorical_pair(df, cat_cols):
     if len(cat_cols) < 2:
-        return None, None, 1
-    best_pair = None
-    min_p = 1
+        logger.warning("Need at least two categorical columns for stacked bar")
+        return None, None
+    valid_pairs = []
     for i, col1 in enumerate(cat_cols):
         for col2 in cat_cols[i+1:]:
             ctab = pd.crosstab(df[col1], df[col2])
             if ctab.size > 0 and ctab.shape[0] > 1 and ctab.shape[1] > 1:
                 try:
                     _, p, _, _ = chi2_contingency(ctab)
-                    if p < min_p:
-                        min_p = p
-                        best_pair = (col1, col2)
+                    valid_pairs.append((col1, col2, p))
                 except:
                     continue
-    return best_pair if best_pair else (cat_cols[0], cat_cols[1]), min_p
+    if valid_pairs:
+        best_pair = min(valid_pairs, key=lambda x: x[2])
+        logger.info(f"Selected categorical pair: {best_pair[0]}, {best_pair[1]}, p-value: {best_pair[2]}")
+        return best_pair[0], best_pair[1]
+    logger.info(f"No valid categorical pair, defaulting to: {cat_cols[0]}, {cat_cols[1]}")
+    return cat_cols[0], cat_cols[1] if len(cat_cols) >= 2 else (None, None)
 
-# Dataset-specific column selection
-def select_dataset_columns(df, dataset_num):
+# Evaluate the best visualization type
+def evaluate_best_viz(df):
     num_cols = df.select_dtypes(include=['number']).columns.tolist()
     cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    num_count = len(num_cols)
+    cat_count = len(cat_cols)
 
-    if dataset_num == 1:
-        football_num = ['goals', 'assists', 'shots', 'passes', 'tackles', 'saves', 'minutes_played']
-        selected_num = [col for col in football_num if col in num_cols][:3]
-        if len(selected_num) < 3:
-            selected_num.extend(select_numeric_columns(df, [col for col in num_cols if col not in selected_num], max_cols=3-len(selected_num)))
-        selected_cat = select_categorical_columns(df, cat_cols, max_cols=2)
-    elif dataset_num == 3:
-        selected_num = ['carat'] if 'carat' in num_cols else select_numeric_columns(df, num_cols, max_cols=1)
-        selected_cat = [col for col in ['cut', 'color'] if col in cat_cols]
-        if len(selected_cat) < 2:
-            selected_cat.extend(select_categorical_columns(df, [col for col in cat_cols if col not in selected_cat], max_cols=2-len(selected_cat)))
-    elif dataset_num == 4:
-        selected_num = [col for col in ['distinct_called_numbers', 'frequency_of_use'] if col in num_cols]
-        if len(selected_num) < 2:
-            selected_num.extend(select_numeric_columns(df, [col for col in num_cols if col not in selected_num], max_cols=2-len(selected_num)))
-        selected_cat = ['age_group'] if 'age_group' in cat_cols else select_categorical_columns(df, cat_cols, max_cols=1)
-    else:
-        selected_num = select_numeric_columns(df, num_cols, max_cols=3)
-        selected_cat = select_categorical_columns(df, cat_cols, max_cols=3)
+    logger.info(f"Evaluating best viz: {num_count} numeric, {cat_count} categorical columns")
 
-    return selected_num, selected_cat
+    if num_count >= 1 and cat_count >= 1:
+        valid_num_cols = select_numeric_columns(df, num_cols)
+        valid_cat_cols = select_categorical_columns(df, cat_cols)
+        if valid_num_cols and valid_cat_cols and df[valid_cat_cols[0]].nunique() <= 20:
+            logger.info("Selected box_plot for numeric and categorical columns")
+            return 'box_plot'
+    if num_count >= 2:
+        valid_num_cols = select_numeric_columns(df, num_cols)
+        if len(valid_num_cols) >= 2:
+            logger.info("Selected heatmap for multiple numeric columns")
+            return 'heatmap'
+        logger.info("Selected scatter_plot for numeric pairs")
+        return 'scatter_plot'
+    elif num_count == 1:
+        if df[num_cols[0]].nunique() > 1:
+            logger.info("Selected histogram for single numeric column")
+            return 'histogram'
+    elif cat_count >= 2:
+        cat_col1, cat_col2 = select_categorical_pair(df, cat_cols)
+        if cat_col1 and cat_col2 and pd.crosstab(df[cat_col1], df[cat_col2]).size > 0:
+            logger.info("Selected stacked_bar for categorical pair")
+            return 'stacked_bar'
+    elif cat_count >= 1:
+        logger.info("Selected count_plot for categorical columns")
+        return 'count_plot'
+    logger.warning("No suitable columns for visualization")
+    return None
 
-# Evaluate visualization options and score them
-def evaluate_visualizations(df, dataset_num):
-    num_cols = df.select_dtypes(include=['number']).columns.tolist()
-    cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
-    scores = {}
+# Create visualization
+def create_visualization(df, label, viz_type):
+    if not os.path.exists('static'):
+        os.makedirs('static')
 
-    selected_num, selected_cat = select_dataset_columns(df, dataset_num)
-
-    if dataset_num == 5:
-        if selected_num:
-            variance = df[selected_num].var().mean() if selected_num else 0
-            scores['histogram'] = variance / (df[selected_num].std().mean() + 1) if variance > 0 else 0
-        else:
-            scores['histogram'] = 0
-
-        if selected_cat:
-            count_score = sum(df[col].value_counts().iloc[:10].sum() for col in selected_cat) / len(df) / max(1, len(selected_cat))
-            scores['count_plot'] = count_score if max(df[col].nunique() for col in selected_cat) <= 20 else count_score * 0.5
-        else:
-            scores['count_plot'] = 0
-
-        if len(num_cols) >= 2:
-            x_col, y_col, corr = select_numeric_pair(df, num_cols)
-            scores['scatter_plot'] = corr if corr > 0.1 else corr * 0.5
-        else:
-            scores['scatter_plot'] = 0
-
-        if len(num_cols) >= 2:
-            corr_matrix = df[num_cols].corr().abs()
-            np.fill_diagonal(corr_matrix.values, 0)
-            scores['heatmap'] = corr_matrix.mean().mean() if not corr_matrix.empty else 0
-        else:
-            scores['heatmap'] = 0
-
-        if len(cat_cols) >= 2:
-            (cat_col1, cat_col2), p = select_categorical_pair(df, cat_cols)
-            assoc_score = 1 - p if p < 1 else 0
-            nunique1 = df[cat_col1].nunique() if cat_col1 else float('inf')
-            nunique2 = df[cat_col2].nunique() if cat_col2 else float('inf')
-            scores['stacked_bar'] = assoc_score if nunique1 <= 20 and nunique2 <= 20 else assoc_score * 0.5
-        else:
-            scores['stacked_bar'] = 0
-    else:
-        if selected_num:
-            iqr = (df[selected_num].quantile(0.75) - df[selected_num].quantile(0.25)).mean() if selected_num else 0
-            scores['box_plot'] = iqr / (df[selected_num].std().mean() + 1) if iqr > 0 else 0
-        else:
-            scores['box_plot'] = 0
-
-        if selected_cat:
-            count_score = sum(df[col].value_counts().iloc[:10].sum() for col in selected_cat) / len(df) / max(1, len(selected_cat))
-            scores['bar_plot'] = count_score if max(df[col].nunique() for col in selected_cat) <= 20 else count_score * 0.5
-        else:
-            scores['bar_plot'] = 0
-
-        if len(num_cols) >= 2:
-            x_col, y_col, corr = select_numeric_pair(df, num_cols)
-            scores['line_plot'] = corr if corr > 0.1 else corr * 0.5
-        else:
-            scores['line_plot'] = 0
-
-        if selected_num:
-            variance = df[selected_num].var().mean() if selected_num else 0
-            scores['violin_plot'] = variance / (df[selected_num].std().mean() + 1) if variance > 0 else 0
-        else:
-            scores['violin_plot'] = 0
-
-        if len(cat_cols) >= 2:
-            (cat_col1, cat_col2), p = select_categorical_pair(df, cat_cols)
-            assoc_score = 1 - p if p < 1 else 0
-            nunique1 = df[cat_col1].nunique() if cat_col1 else float('inf')
-            nunique2 = df[cat_col2].nunique() if cat_col2 else float('inf')
-            scores['clustered_bar'] = assoc_score if nunique1 <= 20 and nunique2 <= 20 else assoc_score * 0.5
-        else:
-            scores['clustered_bar'] = 0
-
-    return scores
-
-# Create visualization based on selected type
-def create_visualization(df, title, viz_type, dataset_num):
     img = BytesIO()
     try:
-        plt.figure(figsize=(12, 8))  # Original figure size
         num_cols = df.select_dtypes(include=['number']).columns.tolist()
         cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
-        selected_num, selected_cat = select_dataset_columns(df, dataset_num)
+        logger.info(f"Creating {viz_type} for {label}, num_cols: {num_cols}, cat_cols: {cat_cols}")
 
-        if dataset_num == 5:
-            if viz_type == 'histogram':
-                if selected_num:
-                    for col in selected_num:
-                        sns.histplot(df[col], kde=True, bins=30, label=col, alpha=0.5)
-                    plt.title(f'{title} - Distribution of Numeric Columns', fontsize=14, pad=15)
-                    plt.xlabel('Value', fontsize=12)
+        # Define a color palette for distinct colors
+        palette = sns.color_palette("husl", n_colors=max(10, len(cat_cols) if cat_cols else 1))
+
+        if viz_type == 'box_plot':
+            valid_num_cols = select_numeric_columns(df, num_cols)
+            valid_cat_cols = select_categorical_columns(df, cat_cols)
+            valid_cat_cols = [col for col in valid_cat_cols if df[col].nunique() <= 20]
+            if valid_num_cols and valid_cat_cols:
+                n_plots = len(valid_num_cols) * len(valid_cat_cols[:1])
+                cols = min(3, max(1, int(np.ceil(np.sqrt(n_plots)))))
+                rows = int(np.ceil(n_plots / cols))
+                fig = plt.figure(figsize=(12, 4 * rows))
+                gs = gridspec.GridSpec(rows, cols)
+                plot_idx = 0
+                for num_col in valid_num_cols:
+                    for cat_col in valid_cat_cols[:1]:
+                        ax = fig.add_subplot(gs[plot_idx // cols, plot_idx % cols])
+                        sns.boxplot(x=cat_col, y=num_col, data=df, ax=ax, order=df[cat_col].value_counts().index[:10], 
+                                    palette=palette[:df[cat_col].nunique()])
+                        ax.set_title(f'{num_col} by {cat_col}', fontsize=10)
+                        ax.set_xlabel(cat_col, fontsize=8)
+                        ax.set_ylabel(num_col, fontsize=8)
+                        ax.tick_params(axis='x', rotation=45, labelsize=8)
+                        if df[cat_col].nunique() <= 10:
+                            ax.legend(title=cat_col, labels=df[cat_col].value_counts().index[:10], fontsize=8, title_fontsize=10)
+                        plot_idx += 1
+                plt.suptitle(f'{label} - Distribution of Numeric Columns by Categories', fontsize=14)
+                plt.tight_layout(rect=[0, 0, 1, 0.95])
+            else:
+                plt.figure(figsize=(12, 8))
+                plt.text(0.5, 0.5, "No suitable columns for box plot", ha='center', va='center', fontsize=12)
+                plt.axis('off')
+                logger.warning(f"No suitable columns for {label} box plot")
+
+        elif viz_type == 'histogram':
+            valid_num_cols = select_numeric_columns(df, num_cols)
+            if valid_num_cols:
+                n_cols = len(valid_num_cols)
+                cols = min(3, max(1, int(np.ceil(np.sqrt(n_cols)))))
+                rows = int(np.ceil(n_cols / cols))
+                fig = plt.figure(figsize=(12, 4 * rows))
+                gs = gridspec.GridSpec(rows, cols)
+                for i, col in enumerate(valid_num_cols):
+                    ax = fig.add_subplot(gs[i // cols, i % cols])
+                    bins = min(50, max(10, int(np.sqrt(len(df)))))
+                    sns.histplot(df[col], kde=True, bins=bins, ax=ax, color=palette[i % len(palette)], 
+                                 kde_kws={'color': palette[(i + 1) % len(palette)], 'label': f'{col} KDE'})
+                    ax.set_title(f'{col} (Unique: {df[col].nunique()})', fontsize=10)
+                    ax.set_xlabel(col, fontsize=8)
+                    ax.set_ylabel('Count', fontsize=8)
+                    ax.legend(title='Data', labels=[f'{col} Histogram', f'{col} KDE'], fontsize=8, title_fontsize=10)
+                plt.suptitle(f'{label} - Distributions of Numeric Columns', fontsize=14)
+                plt.tight_layout(rect=[0, 0, 1, 0.95])
+            else:
+                plt.figure(figsize=(12, 8))
+                plt.text(0.5, 0.5, f"No suitable numeric columns for histogram\nFound: {num_cols}", 
+                         ha='center', va='center', fontsize=12)
+                plt.axis('off')
+                logger.warning(f"No suitable numeric columns for {label} histogram")
+
+        elif viz_type == 'count_plot':
+            valid_cat_cols = select_categorical_columns(df, cat_cols)
+            if valid_cat_cols:
+                n_cols = len(valid_cat_cols)
+                cols = min(3, max(1, int(np.ceil(np.sqrt(n_cols)))))
+                rows = int(np.ceil(n_cols / cols))
+                fig = plt.figure(figsize=(12, 4 * rows))
+                gs = gridspec.GridSpec(rows, cols)
+                for i, col in enumerate(valid_cat_cols):
+                    ax = fig.add_subplot(gs[i // cols, i % cols])
+                    order = df[col].value_counts().index
+                    sns.countplot(data=df, x=col, order=order, ax=ax, palette=palette[:df[col].nunique()])
+                    ax.set_title(f'{col} (Unique: {df[col].nunique()})', fontsize=10)
+                    ax.set_xlabel(col, fontsize=8)
+                    ax.set_ylabel('Count', fontsize=8)
+                    ax.tick_params(axis='x', rotation=45)
+                    if df[col].nunique() <= 10:
+                        ax.legend(title=col, labels=df[col].value_counts().index[:10], fontsize=8, title_fontsize=10)
+                plt.suptitle(f'{label} - Frequencies of Categorical Columns', fontsize=14)
+                plt.tight_layout(rect=[0, 0, 1, 0.95])
+            else:
+                plt.figure(figsize=(12, 8))
+                plt.text(0.5, 0.5, "No categorical columns for count plot", ha='center', va='center', fontsize=12)
+                plt.axis('off')
+                logger.warning(f"No suitable columns for {label} count plot")
+
+        elif viz_type == 'scatter_plot':
+            valid_num_cols = select_numeric_columns(df, num_cols)
+            if len(valid_num_cols) >= 2:
+                pairs = [(valid_num_cols[i], valid_num_cols[j]) for i in range(len(valid_num_cols)) 
+                         for j in range(i+1, len(valid_num_cols))]
+                n_pairs = len(pairs)
+                cols = min(3, max(1, int(np.ceil(np.sqrt(n_pairs)))))
+                rows = int(np.ceil(n_pairs / cols))
+                fig = plt.figure(figsize=(12, 4 * rows))
+                gs = gridspec.GridSpec(rows, cols)
+                for i, (x_col, y_col) in enumerate(pairs):
+                    ax = fig.add_subplot(gs[i // cols, i % cols])
+                    marker_size = max(5, 50 / np.sqrt(len(df)))
+                    if cat_cols:
+                        sns.scatterplot(x=x_col, y=y_col, hue=cat_cols[0], data=df, alpha=0.6, s=marker_size, ax=ax, 
+                                        palette=palette[:df[cat_cols[0]].nunique()])
+                        ax.legend(title=cat_cols[0], fontsize=8, title_fontsize=10)
+                    else:
+                        sns.scatterplot(x=x_col, y=y_col, data=df, alpha=0.6, s=marker_size, ax=ax, 
+                                        color=palette[i % len(palette)], label=f'{x_col} vs {y_col}')
+                        ax.legend(fontsize=8, title_fontsize=10)
+                    ax.set_title(f'{x_col} vs {y_col}', fontsize=10)
+                    ax.set_xlabel(x_col, fontsize=8)
+                    ax.set_ylabel(y_col, fontsize=8)
+                plt.suptitle(f'{label} - Numeric Relationships', fontsize=14)
+                plt.tight_layout(rect=[0, 0, 1, 0.95])
+            else:
+                plt.figure(figsize=(12, 8))
+                plt.text(0.5, 0.5, "Need at least two numeric columns for scatter plot", ha='center', va='center', fontsize=12)
+                plt.axis('off')
+                logger.warning(f"No suitable columns for {label} scatter plot")
+
+        elif viz_type == 'heatmap':
+            valid_num_cols = select_numeric_columns(df, num_cols)
+            if len(valid_num_cols) >= 2:
+                corr = df[valid_num_cols].corr()
+                plt.figure(figsize=(max(8, len(valid_num_cols)), max(8, len(valid_num_cols))))
+                sns.heatmap(corr, annot=True, cmap='coolwarm', fmt=".2f", vmin=-1, vmax=1, square=True, annot_kws={'size': 8})
+                plt.title(f'{label} - Correlation Heatmap of Numeric Columns', fontsize=14)
+            else:
+                plt.figure(figsize=(12, 8))
+                plt.text(0.5, 0.5, "Need at least two numeric columns for heatmap", ha='center', va='center', fontsize=12)
+                plt.axis('off')
+                logger.warning(f"No suitable columns for {label} heatmap")
+
+        elif viz_type == 'stacked_bar':
+            valid_cat_cols = select_categorical_columns(df, cat_cols)
+            cat_col1, cat_col2 = select_categorical_pair(df, valid_cat_cols)
+            if cat_col1 and cat_col2 and df[cat_col1].nunique() > 0 and df[cat_col2].nunique() > 0:
+                ctab = pd.crosstab(df[cat_col1], df[cat_col2])
+                if not ctab.empty:
+                    plt.figure(figsize=(12, 8))
+                    ctab.plot(kind='bar', stacked=True, color=palette[:df[cat_col2].nunique()])
+                    plt.title(f'{label} - Relationship between {cat_col1} and {cat_col2}', fontsize=14)
+                    plt.xlabel(cat_col1, fontsize=12)
                     plt.ylabel('Count', fontsize=12)
-                    plt.legend(title='Column', fontsize=10, title_fontsize=12)
+                    plt.xticks(rotation=45, ha='right', fontsize=10)
+                    plt.legend(title=cat_col2, fontsize=10, title_fontsize=12)
                 else:
-                    plt.text(0.5, 0.5, "No numeric columns for histogram", ha='center', va='center', fontsize=12)
-
-            elif viz_type == 'count_plot':
-                if selected_cat:
-                    fig, axes = plt.subplots(1, len(selected_cat), figsize=(12, 8), sharey=True)
-                    axes = [axes] if len(selected_cat) == 1 else axes
-                    for ax, col in zip(axes, selected_cat):
-                        top_categories = df[col].value_counts().index[:10]
-                        sns.countplot(data=df[df[col].isin(top_categories)], x=col, order=top_categories, ax=ax)
-                        ax.set_title(f'{col}', fontsize=12)
-                        ax.set_xlabel(col, fontsize=10)
-                        ax.set_ylabel('Count', fontsize=10)
-                        ax.tick_params(axis='x', rotation=45, labelsize=8)
-                    plt.suptitle(f'{title} - Frequency of Categorical Columns', fontsize=14, y=1.05)
-                    plt.tight_layout()
-                else:
-                    plt.text(0.5, 0.5, "No categorical columns for count plot", ha='center', va='center', fontsize=12)
-
-            elif viz_type == 'scatter_plot':
-                x_col, y_col, _ = select_numeric_pair(df, num_cols)
-                hue_col = selected_cat[0] if selected_cat else None
-                if x_col and y_col:
-                    sample_df = df.sample(n=min(300, len(df)), random_state=1)
-                    sns.scatterplot(x=x_col, y=y_col, hue=hue_col, data=sample_df, alpha=0.6)
-                    plt.title(f'{title} - Relationship between {x_col} and {y_col}', fontsize=14, pad=15)
-                    plt.xlabel(x_col, fontsize=12)
-                    plt.ylabel(y_col, fontsize=12)
-                    if hue_col:
-                        plt.legend(title=hue_col, fontsize=10, title_fontsize=12)
-                else:
-                    plt.text(0.5, 0.5, "Need at least two numeric columns for scatter plot", ha='center', va='center', fontsize=12)
-
-            elif viz_type == 'heatmap':
-                if len(num_cols) >= 2:
-                    corr = df[num_cols].corr()
-                    sns.heatmap(corr, annot=True, cmap='coolwarm', fmt=".2f", vmin=-1, vmax=1, square=True, annot_kws={'size': 10})
-                    plt.title(f'{title} - Correlation Heatmap of Numeric Variables', fontsize=14, pad=15)
-                else:
-                    plt.text(0.5, 0.5, "Need at least two numeric columns for heatmap", ha='center', va='center', fontsize=12)
-
-            elif viz_type == 'stacked_bar':
-                cat_col1, cat_col2 = select_categorical_pair(df, cat_cols)[0]
-                if cat_col1 and cat_col2 and df[cat_col1].nunique() <= 10 and df[cat_col2].nunique() <= 10:
-                    top_cat1 = df[cat_col1].value_counts().index[:10]
-                    top_cat2 = df[cat_col2].value_counts().index[:10]
-                    filtered_df = df[df[cat_col1].isin(top_cat1) & df[cat_col2].isin(top_cat2)]
-                    if not filtered_df.empty:
-                        ctab = pd.crosstab(filtered_df[cat_col1], filtered_df[cat_col2])
-                        ctab.plot(kind='bar', stacked=True)
-                        plt.title(f'{title} - Relationship between {cat_col1} and {cat_col2}', fontsize=14, pad=15)
-                        plt.xlabel(cat_col1, fontsize=12)
+                    plt.figure(figsize=(12, 8))
+                    plt.text(0.5, 0.5, "Crosstab empty, trying count plot", ha='center', va='center', fontsize=12)
+                    plt.axis('off')
+                    logger.warning(f"Empty crosstab for {label} stacked bar, falling back to count plot")
+                    if valid_cat_cols:
+                        cat_col = valid_cat_cols[0]
+                        plt.figure(figsize=(12, 8))
+                        sns.countplot(data=df, x=cat_col, palette=palette[:df[cat_col].nunique()])
+                        plt.title(f'{label} - Frequency of {cat_col}', fontsize=14)
+                        plt.xlabel(cat_col, fontsize=12)
                         plt.ylabel('Count', fontsize=12)
                         plt.xticks(rotation=45, ha='right', fontsize=10)
-                        plt.legend(title=cat_col2, fontsize=10, title_fontsize=12)
-                    else:
-                        plt.text(0.5, 0.5, "No data available after filtering categories", ha='center', va='center', fontsize=12)
-                else:
-                    plt.text(0.5, 0.5, f"Need two categorical columns with ≤10 unique values", ha='center', va='center', fontsize=12)
-        else:
-            if viz_type == 'box_plot':
-                if selected_num:
-                    sns.boxplot(data=df[selected_num])
-                    plt.title(f'{title} - Box Plot of Numeric Columns', fontsize=14, pad=15)
-                    plt.ylabel('Value', fontsize=12)
-                    plt.legend(labels=selected_num, title='Column', fontsize=10, title_fontsize=12)
-                else:
-                    plt.text(0.5, 0.5, "No numeric columns for box plot", ha='center', va='center', fontsize=12)
+                        if df[cat_col].nunique() <= 10:
+                            plt.legend(title=cat_col, labels=df[cat_col].value_counts().index[:10], fontsize=10, title_fontsize=12)
+            else:
+                plt.figure(figsize=(12, 8))
+                plt.text(0.5, 0.5, f"No suitable categorical columns for stacked bar\nCols: {cat_col1}, {cat_col2}", 
+                         ha='center', va='center', fontsize=12)
+                plt.axis('off')
+                logger.warning(f"No suitable columns for {label} stacked bar")
 
-            elif viz_type == 'bar_plot':
-                if selected_cat:
-                    fig, axes = plt.subplots(1, len(selected_cat), figsize=(12, 8), sharey=True)
-                    axes = [axes] if len(selected_cat) == 1 else axes
-                    for ax, col in zip(axes, selected_cat):
-                        top_categories = df[col].value_counts().index[:10]
-                        sns.barplot(x=df[col].value_counts().index[:10], y=df[col].value_counts().values[:10], ax=ax)
-                        ax.set_title(f'{col}', fontsize=12)
-                        ax.set_xlabel(col, fontsize=10)
-                        ax.set_ylabel('Count', fontsize=10)
-                        ax.tick_params(axis='x', rotation=45, labelsize=8)
-                    plt.suptitle(f'{title} - Bar Plot of Categorical Columns', fontsize=14, y=1.05)
-                    plt.tight_layout()
-                else:
-                    plt.text(0.5, 0.5, "No categorical columns for bar plot", ha='center', va='center', fontsize=12)
-
-            elif viz_type == 'line_plot':
-                x_col, y_col, _ = select_numeric_pair(df, num_cols)
-                hue_col = selected_cat[0] if selected_cat else None
-                if x_col and y_col:
-                    sample_df = df.sample(n=min(300, len(df)), random_state=1).sort_values(x_col)
-                    sns.lineplot(x=sample_df[x_col], y=sample_df[y_col], hue=hue_col)
-                    plt.title(f'{title} - Line Plot of {x_col} vs {y_col}', fontsize=14, pad=15)
-                    plt.xlabel(x_col, fontsize=12)
-                    plt.ylabel(y_col, fontsize=12)
-                    if hue_col:
-                        plt.legend(title=hue_col, fontsize=10, title_fontsize=12)
-                else:
-                    plt.text(0.5, 0.5, "Need at least two numeric columns for line plot", ha='center', va='center', fontsize=12)
-
-            elif viz_type == 'violin_plot':
-                if selected_num:
-                    sns.violinplot(data=df[selected_num])
-                    plt.title(f'{title} - Violin Plot of Numeric Columns', fontsize=14, pad=15)
-                    plt.ylabel('Value', fontsize=12)
-                    plt.legend(labels=selected_num, title='Column', fontsize=10, title_fontsize=12)
-                else:
-                    plt.text(0.5, 0.5, "No numeric columns for violin plot", ha='center', va='center', fontsize=12)
-
-            elif viz_type == 'clustered_bar':
-                cat_col1, cat_col2 = select_categorical_pair(df, cat_cols)[0]
-                if cat_col1 and cat_col2 and df[cat_col1].nunique() <= 10 and df[cat_col2].nunique() <= 10:
-                    top_cat1 = df[cat_col1].value_counts().index[:10]
-                    top_cat2 = df[cat_col2].value_counts().index[:10]
-                    filtered_df = df[df[cat_col1].isin(top_cat1) & df[cat_col2].isin(top_cat2)]
-                    if not filtered_df.empty:
-                        sns.countplot(data=filtered_df, x=cat_col1, hue=cat_col2)
-                        plt.title(f'{title} - Clustered Bar Plot of {cat_col1} and {cat_col2}', fontsize=14, pad=15)
-                        plt.xlabel(cat_col1, fontsize=12)
-                        plt.ylabel('Count', fontsize=12)
-                        plt.xticks(rotation=45, ha='right', fontsize=10)
-                        plt.legend(title=cat_col2, fontsize=10, title_fontsize=12)
-                    else:
-                        plt.text(0.5, 0.5, "No data available after filtering categories", ha='center', va='center', fontsize=12)
-                else:
-                    plt.text(0.5, 0.5, f"Need two categorical columns with ≤10 unique values", ha='center', va='center', fontsize=12)
-
-        plt.tight_layout(pad=2.0)
-        plt.savefig(img, format='png', bbox_inches='tight', dpi=100)  # Original DPI
-        img.seek(0)
-        plot = f'data:image/png;base64,{base64.b64encode(img.getvalue()).decode()}'
-        plt.close()
-        return plot
-    except Exception as e:
-        logger.error(f"Error plotting {title}: {e}")
-        plt.figure(figsize=(12, 8))
-        plt.text(0.5, 0.5, f"Error generating plot: {str(e)}", ha='center', va='center', fontsize=12)
         plt.savefig(img, format='png', bbox_inches='tight', dpi=100)
         img.seek(0)
         plot = f'data:image/png;base64,{base64.b64encode(img.getvalue()).decode()}'
         plt.close()
-        return plot
+        logger.info(f"Generated {viz_type} for {label}")
 
-# Assign unique visualizations to each dataset
-def assign_visualizations(datasets_scores):
-    available_viz_dataset_5 = ['histogram', 'count_plot', 'scatter_plot', 'heatmap', 'stacked_bar']
-    available_viz_others = ['box_plot', 'bar_plot', 'line_plot', 'violin_plot', 'clustered_bar']
-    assignments = {}
-    used_viz = set()
+    except Exception as e:
+        logger.error(f"Error plotting {label}: {e}")
+        plt.figure(figsize=(12, 8))
+        plt.text(0.5, 0.5, f"Error generating plot: {str(e)}", ha='center', va='center', fontsize=12)
+        plt.axis('off')
+        plt.savefig(img, format='png', bbox_inches='tight')
+        img.seek(0)
+        plot = f'data:image/png;base64,{base64.b64encode(img.getvalue()).decode()}'
+        plt.close()
 
-    for dataset_num in range(1, 6):
-        label = f'Dataset {dataset_num}'
-        scores = datasets_scores.get(label, {})
-        if not scores:
-            assignments[label] = None
-            continue
-        available_viz = available_viz_dataset_5 if dataset_num == 5 else available_viz_others
-        viz_options = [(viz, score) for viz, score in scores.items() if viz in available_viz and viz not in used_viz]
-        if not viz_options:
-            viz_options = [(viz, 0) for viz in available_viz if viz not in used_viz]
-        if viz_options:
-            best_viz = max(viz_options, key=lambda x: x[1])[0]
-            assignments[label] = best_viz
-            used_viz.add(best_viz)
-        else:
-            assignments[label] = None
-    return assignments
-
-# Precompute visualizations
-PRECOMPUTED_PLOTS = {}
-
-def precompute_visualizations():
-    global PRECOMPUTED_PLOTS
-    datasets_scores = {}
-    for i in range(1, 6):
-        label = f'Dataset {i}'
-        title = dataset_titles[i]
-        df = load_data(i)
-        if df is None or df.empty:
-            continue
-        datasets_scores[label] = evaluate_visualizations(df, i)
-    viz_assignments = assign_visualizations(datasets_scores)
-    for i in range(1, 6):
-        label = f'Dataset {i}'
-        title = dataset_titles[i]
-        df = load_data(i)
-        if df is None or df.empty:
-            continue
-        viz_type = viz_assignments.get(label)
-        if viz_type:
-            PRECOMPUTED_PLOTS[label] = create_visualization(df, title, viz_type, i)
-
-# Run during app startup
-with app.app_context():
-    logger.info("Precomputing visualizations")
-    precompute_visualizations()
+    return plot
 
 @app.route('/')
 def index():
     dataset_info = {}
     all_plots = {}
+    dataset_tables = {}
     error = None
 
     try:
         for i in range(1, 6):
-            label = f'Dataset {i}'
-            title = dataset_titles[i]
+            label = dataset_titles[i]
             df = load_data(i)
             if df is None or df.empty:
-                dataset_info[label] = {'context': f"No data available for {title}", 'title': title}
+                dataset_info[label] = {
+                    'title': label,
+                    'context': f"No data available for {label}"
+                }
                 all_plots[label] = None
+                dataset_tables[label] = "<p class='text-gray-500 italic'>No data available</p>"
+                logger.warning(f"No data for {label}")
                 continue
-            context = generate_context(df)
-            dataset_info[label] = {'context': context, 'title': title}
-            all_plots[label] = PRECOMPUTED_PLOTS.get(label)
-            if not all_plots[label]:
-                dataset_info[label]['context'] += "\nNo suitable visualization available."
 
-        return render_template('index.html', info=dataset_info, plots=all_plots, error=error)
+            context = generate_csv_context(df)
+            dataset_info[label] = {
+                'title': label,
+                'context': context
+            }
+
+            dataset_tables[label] = df.to_html(
+                classes='w-full text-sm text-gray-700 border-collapse',
+                index=False,
+                border=0,
+                escape=False
+            )
+
+            viz_type = evaluate_best_viz(df)
+            if viz_type:
+                plot = create_visualization(df, label, viz_type)
+                all_plots[label] = [plot]
+            else:
+                all_plots[label] = None
+                dataset_info[label]['context'] += "\nNo suitable visualization available."
+                logger.warning(f"No suitable visualization for {label}")
+
+        return render_template('index.html', info=dataset_info, plots=all_plots, tables=dataset_tables, error=error)
 
     except Exception as e:
-        logger.error(f"Error processing datasets: {str(e)}")
         error = f"Error processing datasets: {str(e)}"
-        return render_template('index.html', info={}, plots={}, error=error)
+        logger.error(error)
+        return render_template('index.html', info={}, plots={}, tables={}, error=error)
 
-@app.route('/health')
-def health():
-    return 'OK', 200
+# Function to ping the application to prevent spin-down
+def ping_self():
+    try:
+        host = os.getenv('HOST', '0.0.0.0')
+        port = int(os.getenv('PORT', 5000))
+        # Use the Render-provided URL if available, otherwise fallback to localhost
+        app_url = os.getenv('RENDER_EXTERNAL_URL', f'http://{host}:{port}')
+        response = requests.get(f'{app_url}/')
+        logger.info(f"Pinged {app_url}: Status {response.status_code}")
+    except Exception as e:
+        logger.error(f"Ping failed: {str(e)}")
 
 if __name__ == '__main__':
-    # For local development only
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    host = os.getenv('HOST', '0.0.0.0')
+    port = int(os.getenv('PORT', 5000))
+    # Set up scheduler for periodic pings
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(ping_self, 'interval', minutes=14)
+    try:
+        scheduler.start()
+        logger.info("Started scheduler for 14-minute pings")
+        app.run(host=host, port=port, debug=os.getenv('FLASK_ENV', 'development') == 'development')
+    except (KeyboardInterrupt, SystemExit):
+        scheduler.shutdown()
+        logger.info("Scheduler shut down")
