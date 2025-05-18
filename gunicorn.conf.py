@@ -1,16 +1,34 @@
-import os
+# Gunicorn configuration file
 
-# Bind to Render's dynamic port or fallback to 10000
-bind = f"0.0.0.0:{os.getenv('PORT', '10000')}"
-workers = 1  # Reduced from 4 to minimize memory usage
-threads = 2  # Reduced from 4 to lower overhead
-worker_class = "sync"  # Keep async worker for concurrency
-preload_app = True  # Load app once to save memory
-timeout = 30  # Keep default timeout
-keepalive = 2  # Keep default keep-alive
+# Bind to host and port
+bind = "0.0.0.0:10000"
+
+# Number of workers (adjust based on CPU cores)
+workers = 4  # Example: For a 2-core server, (2 * 2) + 1 = 5, but 4 is balanced
+
+# Number of threads per worker (for I/O-bound tasks)
+threads = 4
+
+# Worker class (use 'gevent' for async, requires `pip install gevent`)
+worker_class = "gevent"
+
+# Preload the application to save memory
+preload_app = True
+
+# Timeout for worker processes (in seconds)
+timeout = 30
+
+# Keep-alive time for connections (in seconds)
+keepalive = 2
+
+# Logging configuration
 accesslog = "-"  # Log to stdout
-errorlog = "-"  # Log to stdout
-loglevel = "info"  # Keep info-level logging
-worker_connections = 100  # Reduced from 1000 to limit memory
-max_requests = 500  # Restart workers sooner to prevent leaks
-max_requests_jitter = 50  # Keep jitter for randomization
+errorlog = "-"   # Log to stdout
+loglevel = "info"
+
+# Maximum number of simultaneous clients per worker
+worker_connections = 1000
+
+# Restart workers to prevent memory leaks
+max_requests = 1000
+max_requests_jitter = 50
