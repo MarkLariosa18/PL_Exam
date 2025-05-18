@@ -1,3 +1,4 @@
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -10,9 +11,6 @@ from scipy.stats import chi2_contingency
 import gunicorn
 import logging
 import matplotlib.gridspec as gridspec
-import requests  # Added for pinging
-import threading  # Added for background thread
-import time  # Added for sleep timing
 
 app = Flask(__name__)
 
@@ -434,33 +432,7 @@ def index():
         logger.error(error)
         return render_template('index.html', info={}, plots={}, tables={}, error=error)
 
-# Function to ping the application to prevent spin-down
-def keep_alive():
-    # Get the app URL from environment variable or default to localhost for testing
-    app_url = os.getenv('APP_URL', 'http://localhost:5000')
-    logger.info(f"Starting keep-alive pings to {app_url} every 14 minutes")
-    
-    while True:
-        try:
-            # Send a GET request to the app's root endpoint
-            response = requests.get(app_url, timeout=10)
-            if response.status_code == 200:
-                logger.info(f"Keep-alive ping successful: {app_url} responded with status {response.status_code}")
-            else:
-                logger.warning(f"Keep-alive ping received unexpected status: {response.status_code}")
-        except requests.RequestException as e:
-            logger.error(f"Keep-alive ping failed: {str(e)}")
-        
-        # Wait for 14 minutes (840 seconds) before the next ping
-        time.sleep(840)
-
 if __name__ == '__main__':
-    # Start the keep-alive thread
-    ping_thread = threading.Thread(target=keep_alive, daemon=True)
-    ping_thread.start()
-    logger.info("Keep-alive thread started")
-    
-    # Start the Flask application
     host = os.getenv('HOST', '0.0.0.0')
     port = int(os.getenv('PORT', 5000))
     app.run(host=host, port=port, debug=os.getenv('FLASK_ENV', 'development') == 'development')
