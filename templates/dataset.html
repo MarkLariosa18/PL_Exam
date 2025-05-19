@@ -5,17 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ info.title }} - Dataset Explorer</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/js-cookie@3.0.5/dist/js.cookie.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         body {
             font-family: 'Inter', 'Helvetica', 'Arial', sans-serif;
             margin: 0;
             overflow-x: hidden;
-            transition: background-color 0.3s ease, color 0.3s ease;
-        }
-        .dark body {
-            background-color: #1f2937;
-            color: #f3f4f6;
+            background-color: #f9fafb;
         }
         .dataset-card {
             transition: transform 0.3s ease, box-shadow 0.3s ease;
@@ -31,11 +28,8 @@
             .toggle-table:hover {
                 color: #2563eb;
             }
-            .theme-toggle:hover {
-                background-color: #2563eb;
-            }
-            .dark .theme-toggle:hover {
-                background-color: #93c5fd;
+            .clear-cache:hover {
+                background-color: #dc2626;
             }
         }
         .hero-section {
@@ -88,10 +82,6 @@
             background: linear-gradient(to right, #fee2e2, #fef2f2);
             border-left: 5px solid #ef4444;
         }
-        .dark .error-message {
-            background: linear-gradient(to right, #7f1d1d, #991b1b);
-            border-left: 5px solid #f87171;
-        }
         .visualization-image {
             transition: opacity 0.3s ease, transform 0.3s ease;
             width: 100%;
@@ -100,9 +90,6 @@
             object-fit: contain;
             border: 1px solid #e5e7eb;
             border-radius: 10px;
-        }
-        .dark .visualization-image {
-            border-color: #4b5563;
         }
         .table-container {
             max-height: 0;
@@ -123,44 +110,48 @@
             text-align: left;
             border-bottom: 1px solid #e5e7eb;
         }
-        .dark th, .dark td {
-            border-bottom: 1px solid #4b5563;
-        }
         th {
             background-color: #f1f5f9;
             font-weight: 600;
             color: #1f2937;
         }
-        .dark th {
-            background-color: #374151;
-            color: #f3f4f6;
-        }
         td {
             color: #4b5563;
         }
-        .dark td {
-            color: #d1d5db;
-        }
         tr:nth-child(even) {
             background-color: #f9fafb;
-        }
-        .dark tr:nth-child(even) {
-            background-color: #2d3748;
         }
         .toggle-table {
             cursor: pointer;
             color: #3b82f6;
             transition: color 0.2s ease;
         }
-        .dark .toggle-table {
-            color: #60a5fa;
+        .clear-cache {
+            transition: background-color 0.3s ease;
         }
-        .theme-toggle {
-            transition: background-color 0.3s ease, color 0.3s ease;
+        .loading-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+            justify-content: center;
+            align-items: center;
+            z-index: 2000;
         }
-        .dark .theme-toggle {
-            background-color: #60a5fa;
-            color: #1f2937;
+        .loading-spinner {
+            border: 4px solid #f3f4f6;
+            border-top: 4px solid #3b82f6;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
         @keyframes fade-in {
             from { opacity: 0; }
@@ -185,7 +176,7 @@
         }
     </style>
 </head>
-<body class="bg-gray-50 dark:bg-gray-800">
+<body>
     <!-- Hero Section -->
     <header class="hero-section text-white py-12 sm:py-16 md:py-20 lg:py-24">
         <div class="container mx-auto px-4 text-center">
@@ -198,20 +189,20 @@
     <!-- Main Content -->
     <main class="container mx-auto px-4 py-8 sm:py-12 md:py-16">
         <div class="mb-8">
-            <a href="{{ url_for('index') }}" class="text-blue-600 dark:text-blue-400 hover:underline text-sm sm:text-base">
+            <a href="{{ url_for('index') }}" class="text-blue-600 hover:underline text-sm sm:text-base">
                 Back to Datasets
             </a>
         </div>
         {% if error %}
-            <div class="error-message text-red-700 dark:text-red-300 p-4 sm:p-6 mb-8 rounded-xl shadow-md animate-slide-in" role="alert">
+            <div class="error-message text-red-700 p-4 sm:p-6 mb-8 rounded-xl shadow-md animate-slide-in" role="alert">
                 <p class="font-semibold text-sm sm:text-base md:text-lg">{{ error }}</p>
             </div>
         {% else %}
-            <div class="dataset-card bg-white dark:bg-gray-700 rounded-xl p-5 sm:p-6 shadow-lg animate-fade-in-up">
-                <h2 class="text-xl sm:text-2xl font-semibold text-gray-900 dark:text-gray-100 mb-4 text-center">
+            <div class="dataset-card bg-white rounded-xl p-5 sm:p-6 shadow-lg animate-fade-in-up">
+                <h2 class="text-xl sm:text-2xl font-semibold text-gray-900 mb-4 text-center">
                     {{ info.title }}
                 </h2>
-                <p class="text-gray-600 dark:text-gray-300 mb-4 leading-relaxed text-sm sm:text-base whitespace-pre-line">
+                <p class="text-gray-600 mb-4 leading-relaxed text-sm sm:text-base whitespace-pre-line">
                     {{ info.context | safe }}
                 </p>
                 {% if plot %}
@@ -223,7 +214,7 @@
                              loading="lazy">
                     </div>
                 {% else %}
-                    <p class="text-gray-500 dark:text-gray-400 italic text-sm sm:text-base mt-4 text-center">
+                    <p class="text-gray-500 italic text-sm sm:text-base mt-4 text-center">
                         No visualization available for {{ info.title }}
                     </p>
                 {% endif %}
@@ -237,6 +228,10 @@
                         </div>
                     </div>
                 {% endif %}
+                <button class="clear-cache bg-red-600 text-white px-4 py-2 rounded-lg mt-4 text-sm font-medium"
+                        onclick="clearCache('{{ info.title | lower }}')">
+                    Clear Cache
+                </button>
             </div>
         {% endif %}
     </main>
@@ -247,6 +242,10 @@
         <img id="modalImage" src="" alt="Enlarged Visualization" class="modal-content">
     </div>
 
+    <!-- Loading Overlay -->
+    <div id="loadingOverlay" class="loading-overlay">
+        <div class="loading-spinner"></div>
+    </div>
 
     <script>
         // Modal functionality
@@ -267,6 +266,58 @@
         function toggleTable(tableId) {
             const tableContainer = document.getElementById(tableId);
             tableContainer.classList.toggle('show');
+        }
+
+        // Cache management
+        function clearCache(datasetTitle) {
+            Cookies.remove(`dataset_${datasetTitle}_context`);
+            Cookies.remove(`dataset_${datasetTitle}_plot`);
+            Cookies.remove(`dataset_${datasetTitle}_table`);
+            alert('Cache cleared for ' + datasetTitle);
+            window.location.reload(); // Force server fetch
+        }
+
+        // Check for cached data and render if available
+        const datasetTitle = '{{ info.title | lower }}';
+        const cachedContext = Cookies.get(`dataset_${datasetTitle}_context`);
+        const cachedPlot = Cookies.get(`dataset_${datasetTitle}_plot`);
+        const cachedTable = Cookies.get(`dataset_${datasetTitle}_table`);
+
+        const loadingOverlay = document.getElementById('loadingOverlay');
+        const datasetCard = document.querySelector('.dataset-card');
+
+        if (cachedContext && cachedPlot && cachedTable) {
+            // Render cached data
+            datasetCard.querySelector('p.text-gray-600').innerHTML = cachedContext;
+            const img = datasetCard.querySelector('.visualization-image');
+            if (img) {
+                img.src = cachedPlot;
+                img.onclick = () => openModal(cachedPlot);
+            } else {
+                const noVizP = datasetCard.querySelector('p.text-gray-500');
+                if (noVizP) noVizP.style.display = 'none';
+                const div = document.createElement('div');
+                div.className = 'mt-4';
+                div.innerHTML = `<img src="${cachedPlot}" alt="${datasetTitle} Visualization" class="visualization-image rounded-lg cursor-pointer" onclick="openModal('${cachedPlot}')" loading="lazy">`;
+                datasetCard.querySelector('.toggle-table').parentNode.insertBefore(div, datasetCard.querySelector('.toggle-table'));
+            }
+            const tableContainer = datasetCard.querySelector('#table-1');
+            tableContainer.innerHTML = cachedTable;
+            loadingOverlay.style.display = 'none';
+        } else {
+            // Cache server-rendered data after DOM is ready
+            document.addEventListener('DOMContentLoaded', () => {
+                if (!'{{ error }}') {
+                    Cookies.set(`dataset_${datasetTitle}_context`, '{{ info.context | safe }}', { expires: 7 }); // 7-day expiry
+                    {% if plot %}
+                        Cookies.set(`dataset_${datasetTitle}_plot`, '{{ plot }}', { expires: 7 });
+                    {% endif %}
+                    {% if table %}
+                        Cookies.set(`dataset_${datasetTitle}_table`, `{{ table | safe | replace('\n', '') }}`, { expires: 7 });
+                    {% endif %}
+                }
+                loadingOverlay.style.display = 'none';
+            });
         }
 
         // Close modal on click outside or Escape key
