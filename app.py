@@ -1,4 +1,3 @@
-
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -8,7 +7,6 @@ from io import BytesIO
 import base64
 import numpy as np
 from scipy.stats import chi2_contingency
-import gunicorn
 import logging
 import matplotlib.gridspec as gridspec
 
@@ -384,53 +382,50 @@ def create_visualization(df, label, viz_type):
 
 @app.route('/')
 def index():
-    dataset_info = {}
-    all_plots = {}
-    dataset_tables = {}
+    # Display a list of dataset names as clickable links
+    return render_template('index.html', datasets=dataset_titles)
+
+@app.route('/dataset/<int:dataset_num>')
+def dataset(dataset_num):
+    if dataset_num not in dataset_titles:
+        return render_template('dataset.html', error=f"Invalid dataset number: {dataset_num}")
+
+    label = dataset_titles[dataset_num]
+    info = {}
+    plot = None
+    table = None
     error = None
 
     try:
-        for i in range(1, 6):
-            label = dataset_titles[i]
-            df = load_data(i)
-            if df is None or df.empty:
-                dataset_info[label] = {
-                    'title': label,
-                    'context': f"No data available for {label}"
-                }
-                all_plots[label] = None
-                dataset_tables[label] = "<p class='text-gray-500 italic'>No data available</p>"
-                logger.warning(f"No data for {label}")
-                continue
+        df = load_data(dataset_num)
+        if df is None or df.empty:
+            error = f"No data available for {label}"
+            logger.warning(error)
+            return render_template('dataset.html', info={'title': label, 'context': error}, plot=None, table=None, error=error)
 
-            context = generate_csv_context(df)
-            dataset_info[label] = {
-                'title': label,
-                'context': context
-            }
+        context = generate_csv_context(df)
+        info = {'title': label, 'context': context}
 
-            dataset_tables[label] = df.to_html(
-                classes='w-full text-sm text-gray-700 border-collapse',
-                index=False,
-                border=0,
-                escape=False
-            )
+        table = df.to_html(
+            classes='w-full text-sm text-gray-700 border-collapse',
+            index=False,
+            border=0,
+            escape=False
+        )
 
-            viz_type = evaluate_best_viz(df)
-            if viz_type:
-                plot = create_visualization(df, label, viz_type)
-                all_plots[label] = [plot]
-            else:
-                all_plots[label] = None
-                dataset_info[label]['context'] += "\nNo suitable visualization available."
-                logger.warning(f"No suitable visualization for {label}")
+        viz_type = evaluate_best_viz(df)
+        if viz_type:
+            plot = create_visualization(df, label, viz_type)
+        else:
+            info['context'] += "\nNo suitable visualization available."
+            logger.warning(f"No suitable visualization for {label}")
 
-        return render_template('index.html', info=dataset_info, plots=all_plots, tables=dataset_tables, error=error)
+        return render_template('dataset.html', info=info, plot=plot, table=table, error=error)
 
     except Exception as e:
-        error = f"Error processing datasets: {str(e)}"
+        error = f"Error processing dataset {label}: {str(e)}"
         logger.error(error)
-        return render_template('index.html', info={}, plots={}, tables={}, error=error)
+        return render_template('dataset.html', info={'title': label, 'context': ''}, plot=None, table=None, error=error)
 
 if __name__ == '__main__':
     host = os.getenv('HOST', '0.0.0.0')
